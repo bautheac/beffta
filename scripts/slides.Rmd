@@ -1,0 +1,82 @@
+---
+title: "Strathclyde Business School - finTech MSc - beffta fall 2018"
+author: "Olivier Bauthéac"
+date: "29/10/2018"
+output: 
+    ioslides_presentation:
+      logo: logo.png
+      widescreen: true
+      smaller: true
+---
+
+## Data-science finance: an emerging field
+
+Bringing modern data collection and wrangling tools as well as statistical learning methods into finance: adapt & apply.
+
+
+## Plan of action
+
+Learning-by-doing approach to the data-science pipeline:  
+  
+  
+![](data-science.png)
+
+
+
+## Preprocessing: extract, load, transform (ELT)
+
+* "Data-scientists spend most of their time massaging rather than mining data". Gil Press, *Forbes* columnist.  
+* It is often reported that data preparation accounts for about 80% of the work of data-scientists.  
+  
+* Spend quality time constructing robust data extraction tools and building up your data wrangling skills; this project will help you on this.  
+
+
+## Extract {.smaller}
+
+* Pull financial data from Bloomberg for a market index as well as a cross-section of US stocks. 
+  
+* Organise the data in an excel workbook according to specific guidelines.  
+
+
+## Load {.smaller}
+
+* Using the R or Python programming languages, load the retrieved Bloomberg financial data in memory.  
+  
+* Organise the data in dataframes according to guidelines.  
+
+
+## Transform {.smaller}
+
+* Construct a returns dataframe.  
+  
+* For each stock construct an estimate of market risk and organise the results in a dataframe.  
+  
+* Construct a number of feature interactions: financial ratios.
+
+
+## Explore, visualise
+
+Explore and visualise the feature interactions dataset using appropriate visualisation tools.
+
+
+## Model
+
+* Unsupervised learning: clustering analysis.  
+    + Using the k-means clustering algorithm, partition the feature interactions dataset into groups.  
+    + Name the groups according to group-specific characteristics.  
+  
+* Supervised learning: classification analysis.
+    + Merge the feature interactions dataset with the original datasets.
+    + Try various classifiers on the resulting super-dataset where the target variable is the group label variable constructed above.  
+    
+## Communicate
+
+You are free to present you work as you like.
+    
+
+
+## Assignment
+
+<https://strathclyde.github.io/befftafall2018/>
+
+ 

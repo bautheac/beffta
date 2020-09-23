@@ -1,0 +1,6 @@
+navbar:
+  title: 'beffta'
+  type: inverse
+  left:
+    - text: 'home'
+      href: index.html

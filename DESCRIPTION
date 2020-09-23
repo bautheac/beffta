@@ -1,0 +1,13 @@
+Package: beffta
+Title: becoming an effective technology analyst
+Version: 0.0.1.0
+Authors@R: person("Olivier", "Bauthéac", email = "o.bautheac@gmail.com", role = c("aut", "cre"))
+Description: This package host assignment material for the "becoming an effective technology analyst" 
+  class as part of the coursework of the Strathclyde Business School MSc fintech program.
+Depends: R (>= 3.4.0)
+License: GPL-3
+Encoding: UTF-8
+LazyData: true
+URL: https://github.com/bautheac/beffta
+BugReports: https://github.com/bautheac/beffta/issues
+RoxygenNote: 6.0.1

@@ -1,0 +1,898 @@
+---
+title: 'Full stack data science finance (small) project'
+output: html_notebook
+---
+
+
+# R
+
+## Import
+
+See excel file in that folder
+
+## Load & tidy up
+```{r, message = FALSE}
+library(readxl); library(dplyr); library(data.table)
+
+path <- '../data-raw/pullit - US broad cross section - relative.xlsm'; ticker_market <- 'RAY Index'; window <- 252L
+
+ticker_firms <- read_excel(path, sheet = "update", range = cell_cols("D")) %>% filter(ticker != ticker_market)
+
+static <- read_excel(path, sheet = "update", range = cell_cols("D:H")) %>% filter(ticker != ticker_market)
+
+tickers <- gsub(pattern = '/', replacement = '~', x = c(ticker_market, ticker_firms$ticker))
+
+historical <- lapply(tickers, function(x) read_excel(path, sheet = x, skip = 1L) %>% mutate(ticker = x) %>% filter(! is.na(Date))) %>% 
+  rbindlist()
+```
+
+
+
+## Transform
+
+### 1-year trailing market betas
+
+#### Dataset
+```{r message = FALSE, warning = FALSE}
+library(tidyr); library(tibble)
+returns <- tibble(ticker = historical$ticker, date = historical$Date, close = as.numeric(historical$PX_LAST)) %>%
+    group_by(ticker) %>% mutate(return = close / lag(close, 1L) - 1L) %>% select(ticker, date, return) %>%
+    spread(ticker, return)
+```
+
+#### Values
+```{r message = FALSE, warning = FALSE}
+market <- select(slice(returns, (n() - window + 1L):n()), date, market = !! ticker_market)
+stocks <- select(slice(returns, (n() - window + 1L):n()), -ticker_market)
+
+market_risk <- function(x) 
+    summary(lm('stock ~ market', data = tibble(stock = x, market = market$market, by = 'date'), na.action = na.omit))$coeff[2L, 1L]
+
+betas_static <- apply(select(stocks, -date), market_risk, MARGIN = 2L)
+betas_static <- tibble(ticker = names(betas_static), beta = betas_static) %>%
+    mutate(category = ifelse(beta >= 1L, 'aggressive', 'conservative'))
+```
+
+#### Plot
+```{r message = FALSE, warning = FALSE, fig.height = 4.75, fig.width = 9.5}
+library(ggplot2); library(ggthemes); library(plotly)
+
+p <- ggplot(betas_static, aes(beta)) + geom_histogram(binwidth = 0.05, fill = 'bisque', alpha = 0.5) + 
+    labs(x = 'market beta', y = '', title = 'Contemporaneous 1-year market betas distribution') +
+    theme_tufte()
+
+ggplotly(p)
+```
+
+
+### 1-year rolling market betas
+
+#### Values
+```{r message = FALSE, warning = FALSE}
+library(purrr); library(xts)
+
+returns <- xts(select(rename(returns, market = !! ticker_market), -date), order.by = returns$date)
+
+betas_rolling <- lapply(names(returns)[names(returns) != 'market'], function(x){
+  data <- rollapply(setNames(returns[, c(x, 'market')], c('stock', 'market')), window,
+                    function(y) ifelse(all(is.na(y$stock)), NA,
+                                       coef(lm(stock ~ market, data = y, na.action = na.omit))['market']),
+                    by.column = FALSE) %>% setNames(x)
+  as.tibble(data) %>% mutate(date = index(data))
+  }) %>% reduce(left_join, by = 'date') %>% filter_at(vars(-date), any_vars(!is.na(.))) %>%
+  select(date, everything())
+```
+
+
+#### Plot
+```{r fig.height = 4.75, fig.width = 9.5}
+library(dygraphs)
+
+tickers <- names(betas_rolling)[sample(1L:ncol(betas_rolling), 5L)]
+
+dygraph(xts(betas_rolling[, tickers], order.by = betas_rolling$date), main = 'Trailing 1-year market risk') %>% 
+  dyAxis('y', label = 'market beta') %>% dyLegend(show = "follow") %>% dyRangeSelector(height = 20L)
+```
+
+
+
+
+### Ratios
+
+#### Values
+```{r message = FALSE, warning = FALSE}
+ratios <- filter(historical, ticker != !!ticker_market) %>% group_by(ticker) %>% filter(row_number() == n()) %>% ungroup() %>%
+  mutate_at(vars(-c(Date, ticker)), funs(as.numeric)) %>%
+  mutate(`price to earnings` = PX_LAST / TRAIL_12M_EPS, `price to book` = PX_LAST / BOOK_VAL_PER_SH, 
+         `dividend yield` = TRAIL_12M_DVD_PER_SH / PX_LAST, `debt to equity` = SHORT_AND_LONG_TERM_DEBT / TOTAL_EQUITY) %>%
+  select(ticker, `price to earnings`, `price to book`, `dividend yield`, `debt to equity`)
+
+```
+
+
+#### Plot
+```{r fig.height = 4.75, fig.width = 9.5, message = FALSE, warning = FALSE}
+# library(psych)
+# 
+# pairs.panels(x = scale(select(ratios, -ticker)), pch = 1L, smooth = FALSE, ellipses = FALSE, 
+#              hist.col = 'bisque', alpha = 0.5, breaks = 20L, cex = 0.5)
+
+pairs(select(ratios, -ticker), labels = c('price to earning', 'price to book', 'dividend yield', 'debt to equity'))
+```
+
+Lot of samples seem rather crammed, let's try log scales.
+
+```{r fig.height = 4.75, fig.width = 9.5, message = FALSE, warning = FALSE}
+pairs(select(ratios, -ticker), labels = c('price to earning', 'price to book', 'dividend yield', 'debt to equity'), log = 'xy')
+```
+
+Evidence of two groups in several plots.
+
+## Model
+
+### Cluster analysis
+
+#### Dataset
+```{r message = FALSE, warning = FALSE}
+ratios <- ratios %>% filter(complete.cases(.)) %>% as.data.frame()
+rownames(ratios) <- ratios$ticker
+ratios <- select(ratios, -ticker) %>% scale()
+```
+
+#### Dendogram
+
+Draw a higher order clustering dendogram, inspect for confirmation of the previous results.
+
+```{r fig.height = 4.75, fig.width = 9.5, message = FALSE, warning = FALSE}
+library(factoextra)
+eclust(ratios, 'hclust', k = 5L) %>% fviz_dend(rect = TRUE)
+```
+
+Dendogram suggests two clusters: longest branch length occurs between two and three clusters.
+
+#### k-means with 2 clusters
+```{r message = FALSE, warning = FALSE}
+set.seed(4321L)
+clusters <- kmeans(ratios, 2L, nstart = 15L)
+clusters <- tibble(ticker = names(clusters$cluster), class = clusters$cluster)
+```
+
+#### Cluster characteristics
+```{r message = FALSE, warning = FALSE}
+data <- left_join(as_tibble(ratios, rownames = 'ticker'), clusters, by = 'ticker')
+select(data, -ticker) %>% group_by(class) %>% summarise_all(funs(mean))
+```
+
+Class 1: low P/E, P/B, D/E & high D/P -> 'value' stocks
+Class 2: high P/E, P/B, D/E & low D/P -> 'gowth' stocks
+
+#### Name classes in dataset
+```{r message = FALSE, warning = FALSE}
+
+clusters <- mutate(clusters, class = ifelse(class == 1L, 'value', 'growth') %>% factor())
+
+data <- left_join(clusters, 
+                  filter(historical, ticker != !!ticker_market) %>% group_by(ticker) %>% filter(row_number() == n()) %>% ungroup() %>%
+  mutate_at(vars(-c(Date, ticker)), funs(as.numeric)),
+  by = 'ticker') %>% select(-Date)
+```
+
+
+#### Explore class distribution
+```{r message = FALSE, warning = FALSE}
+
+
+```
+
+
+
+### Classification
+
+#### Dataset
+```{r message = FALSE, warning = FALSE}
+data <- left_join(data, mutate_at(static, vars(-ticker), funs(as.numeric)), by = 'ticker') %>%
+  filter(complete.cases(.)) %>% as.data.frame()
+rownames(data) <- data$ticker
+data <- subset(data, select = -ticker)
+
+
+
+
+
+
+
+ratios <- filter(historical, ticker != !!ticker_market) %>% group_by(ticker) %>% filter(row_number() == n()) %>% ungroup() %>%
+  mutate_at(vars(-c(Date, ticker)), funs(as.numeric)) %>%
+  mutate(`price to earnings` = PX_LAST / TRAIL_12M_EPS, `price to book` = PX_LAST / BOOK_VAL_PER_SH, 
+         `dividend yield` = TRAIL_12M_DVD_PER_SH / PX_LAST, `debt to equity` = SHORT_AND_LONG_TERM_DEBT / TOTAL_EQUITY) %>%
+  select(ticker, `price to earnings`, `price to book`, `dividend yield`, `debt to equity`)
+
+data <- left_join(ratios, mutate_at(static, vars(-ticker), funs(as.numeric)), by = 'ticker') %>%
+  filter(complete.cases(.)) %>% left_join(clusters, by = 'ticker') %>%
+  as.data.frame() 
+rownames(data) <- data$ticker
+data <- subset(data, select = -ticker)
+```
+
+#### Feature selection
+```{r message = FALSE, warning = FALSE}
+library(caret)
+set.seed(4321L); n <- 5L
+split <- createDataPartition(y = data$class, p = 0.75, list = FALSE)
+train <- data[split, ]; test <- data[-split, ]
+
+importance <- filterVarImp(x = subset(train, select = -class), y = train$class)
+features <- as.tibble(importance, rownames = 'ticker') %>% arrange(desc(growth)) %>% slice(1L:n) %>% select(ticker) %>% flatten_chr()
+# features <- c('price to earnings', 'price to book', 'dividend yield', 'debt to equity', )
+train <- train[, c('class', features)]; test <- test[, c('class', features)]
+```
+
+
+#### Logistic regression
+
+##### Fit model
+```{r message = FALSE, warning = FALSE, cache = TRUE}
+controls <- trainControl(method = 'repeatedcv', repeats = 3L, number = 5L, classProbs = TRUE, summaryFunction = twoClassSummary)
+glm_fit <- train(class ~ ., data = train, method = 'glm', family = 'binomial', preProc = c('center', 'scale'), trControl = controls, metric = 'ROC')
+```
+
+###### Assess training set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(glm_fit, subset(train, select = -class))
+confusionMatrix(data = predictions, train$class)
+```
+
+###### Assess test set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(glm_fit, subset(test, select = -class))
+confusionMatrix(data = predictions, test$class)
+```
+
+Training set performance > test set performance: evidence of offerfitting. Let's try to fix that by imposing some contraints on the model using regularization.
+
+##### Penalized logistic regression
+
+###### Fit model
+```{r message = FALSE, warning = FALSE, cache = TRUE}
+plr_grid = data.frame(lambda = seq(0.1, 1, 0.01), cp = 'bic')
+plr_fit <- train(class ~ ., data = train, method = 'plr', preProc = c('center', 'scale'), tuneGrid = plr_grid, trControl = controls, metric = 'ROC')
+```
+
+###### Plot learning curve
+```{r fig.height = 4.75, fig.width = 9.5, message = FALSE, warning = FALSE}
+ggplot(plr_fit)
+```
+
+###### Exlore model selection output
+```{r message = FALSE, warning = FALSE}
+plr_fit$bestTune
+```
+
+
+###### Assess training set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(plr_fit, subset(train, select = -class))
+confusionMatrix(data = predictions, train$class)
+```
+
+###### Assess test set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(plr_fit, subset(test, select = -class))
+confusionMatrix(data = predictions, test$class)
+```
+
+
+
+##### k nearest neighbours
+
+###### Fit model
+```{r message = FALSE, warning = FALSE, cache = TRUE}
+knn_grid = data.frame(k = 1L:10L)
+knn_fit <- train(class ~ ., data = train, method = 'knn', preProc = c('center', 'scale'), tuneGrid = knn_grid, trControl = controls, metric = 'ROC')
+```
+
+###### Plot learning curve
+```{r fig.height = 4.75, fig.width = 9.5, message = FALSE, warning = FALSE}
+ggplot(knn_fit)
+```
+
+###### Exlore model selection output
+```{r message = FALSE, warning = FALSE}
+knn_fit$bestTune
+```
+
+###### Assess training set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(knn_fit, subset(train, select = -class))
+confusionMatrix(data = predictions, train$class)
+```
+
+###### Assess test set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(knn_fit, subset(test, select = -class))
+confusionMatrix(data = predictions, test$class)
+```
+
+
+##### Support vector machines
+
+###### Fit model
+```{r message = FALSE, warning = FALSE, cache = TRUE}
+smv_grid = data.frame(C = seq(0, 5, 0.1))
+smv_fit <- train(class ~ ., data = train, method = 'svmLinear', preProc = c('center', 'scale'), tuneGrid = smv_grid, trControl = controls, metric = 'ROC')
+```
+
+###### Plot learning curve
+```{r fig.height = 4.75, fig.width = 9.5, message = FALSE, warning = FALSE}
+ggplot(smv_fit)
+```
+
+###### Exlore model selection output
+```{r message = FALSE, warning = FALSE}
+smv_fit$bestTune
+```
+
+###### Assess training set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(smv_fit, subset(train, select = -class))
+confusionMatrix(data = predictions, train$class)
+```
+
+###### Assess test set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(smv_fit, subset(test, select = -class))
+confusionMatrix(data = predictions, test$class)
+```
+
+
+##### Decision tree
+
+###### Fit model
+```{r message = FALSE, warning = FALSE, cache = TRUE}
+tree_grid = data.frame(cp = seq(0.5, 1, 0.005))
+tree_fit <- train(class ~ ., data = train, method = 'rpart', preProc = c('center', 'scale'), tuneGrid = tree_grid, trControl = controls, metric = 'ROC')
+```
+
+###### Plot learning curve
+```{r fig.height = 4.75, fig.width = 9.5, message = FALSE, warning = FALSE}
+ggplot(tree_fit)
+```
+
+###### Exlore model selection output
+```{r message = FALSE, warning = FALSE}
+tree_fit$bestTune
+```
+
+###### Assess training set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(tree_fit, subset(train, select = -class))
+confusionMatrix(data = predictions, train$class)
+```
+
+###### Assess test set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(tree_fit, subset(test, select = -class))
+confusionMatrix(data = predictions, test$class)
+```
+
+
+##### Random forest
+
+###### Fit model
+```{r message = FALSE, warning = FALSE, cache = TRUE}
+forest_grid = data.frame(mtry = seq(1L:(n - 1L)))
+forest_fit <- train(class ~ ., data = train, method = 'rf', preProc = c('center', 'scale'), tuneGrid = forest_grid, trControl = controls, metric = 'ROC')
+```
+
+###### Plot learning curve
+```{r fig.height = 4.75, fig.width = 9.5, message = FALSE, warning = FALSE}
+ggplot(forest_fit)
+```
+
+###### Exlore model selection output
+```{r message = FALSE, warning = FALSE}
+forest_fit$bestTune
+```
+
+###### Assess training set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(forest_fit, subset(train, select = -class))
+confusionMatrix(data = predictions, train$class)
+```
+
+###### Assess test set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(forest_fit, subset(test, select = -class))
+confusionMatrix(data = predictions, test$class)
+```
+
+
+
+##### Neural network
+
+###### Fit model
+```{r message = FALSE, warning = FALSE, cache = TRUE}
+nnet_grid = expand.grid(size = 1L:5L, decay = seq(0.01, 0.2, 0.01))
+nnet_fit <- train(class ~ ., data = train, method = 'mlpWeightDecay', preProc = c('center', 'scale'), tuneGrid = nnet_grid, trControl = controls, metric = 'ROC')
+```
+
+###### Plot learning curve
+```{r fig.height = 4.75, fig.width = 9.5, message = FALSE, warning = FALSE}
+ggplot(nnet_fit)
+```
+
+###### Exlore model selection output
+```{r message = FALSE, warning = FALSE}
+nnet_fit$bestTune
+```
+
+###### Assess training set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(nnet_fit, subset(train, select = -class))
+confusionMatrix(data = predictions, train$class)
+```
+
+###### Assess test set performance
+```{r message = FALSE, warning = FALSE}
+predictions <- predict(nnet_fit, subset(test, select = -class))
+confusionMatrix(data = predictions, test$class)
+```
+
+
+
+
+
+
+
+
+
+
+# Python
+
+## Extract
+
+See excel file
+
+## Load & tidy up
+```{python}
+import pandas as pd; import numpy as np
+import matplotlib.pyplot as plt; import seaborn as sns
+import statsmodels.api as sm; import scipy.stats as ss
+
+workbook, window, ticker_market = pd.ExcelFile('../data-raw/pullit - US broad cross section - relative.xlsm'), 252, 'RAY Index'
+tickers = pd.read_excel(workbook, sheet_name = 'update', usecols = 'D', dtype = 'str').ticker.values
+
+static = pd.read_excel(workbook, sheet_name = 'update', usecols = 'D:G')
+static = static.loc[static['ticker'] != ticker_market].set_index('ticker')
+
+historical = {ticker: pd.read_excel(workbook, skiprows = 1, sheet_name  = ticker)
+        for ticker in tickers}
+historical = pd.concat(historical.values(), keys = historical.keys()).dropna(subset = ['Date'])\
+    .reset_index().drop('level_1', axis = 1)
+historical.rename(columns = {'level_0': 'ticker', 'Date': 'date'}, inplace = True)
+historical.set_index(['ticker', 'date'], inplace = True)
+```
+
+
+
+
+
+## Transform
+
+### 1-year market betas
+
+#### Construct returns dataset
+```{python warning = FALSE}
+betas = historical[['PX_LAST']].unstack('ticker').xs('PX_LAST', axis = 1, drop_level = True)\
+    .pct_change().dropna().iloc[-window:, ]
+```
+
+#### Values
+```{python warning = FALSE}
+market = betas[ticker_market]; betas.drop(ticker_market, axis = 1, inplace = True)
+
+betas = betas.apply(lambda stock: ss.linregress(x = market, y = stock).slope, axis = 0)
+betas = pd.DataFrame(betas).reset_index(); betas.columns = ['ticker', 'beta']
+```
+
+#### Plot
+```{python warning = FALSE}
+import plotly.graph_objs as go
+
+# go.Histogram(y = betas['beta'])
+print(betas['beta'])
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### Optimal cluster number
+
+##### Stat test
+```{r message = FALSE, warning = FALSE}
+library(factoextra); library(NbClust)
+# fviz_nbclust(scale(select(data, -ticker)), kmeans, nstart = 25L,  method = "gap_stat", nboot = 50L)+
+#   labs(subtitle = "Gap statistic method")
+clusters <- NbClust(ratios, distance = 'euclidean', min.nc = 2L, max.nc = 10L, method = 'kmeans')
+```
+
+```{r message = FALSE, warning = FALSE, echo = FALSE}
+fviz_nbclust(clusters)
+```
+
+
+Optimal number of clusters is 2.
+
+##### Dendogram
+
+Draw a higher order clustering dendogram, inspect for confirmation of the previous results.
+
+```{r message = FALSE, warning = FALSE}
+eclust(ratios, 'hclust', k = 5L) %>% fviz_dend(rect = TRUE)
+```
+
+Greatest between-levels gap occurs betwen level 1 and 2, confirming that the optimal number clusters is 2.
+
+
+#### Cluster analysis with 2 clusters
+```{r message = FALSE, warning = FALSE}
+clusters <- eclust(ratios, 'kmeans', k = 2L, seed = 4321L)
+clusters <- tibble(ticker = names(clusters$cluster), category = ifelse(clusters$cluster == 1L, 1L, 0L))
+data <- left_join(as_tibble(ratios, rownames = 'ticker'), clusters, by = 'ticker')
+
+select(data, -ticker) %>% group_by(category) %>% summarise_all(funs(mean))
+
+categories <- tibble(id = c(0L, 1L), name = c('growth', 'value'))
+```
+
+
+
+### Classification
+
+#### Construct training and test sets
+```{r message = FALSE, warning = FALSE}
+data <- filter(historical, ticker != !!ticker_market) %>% group_by(ticker) %>% filter(row_number() == n()) %>% ungroup() %>% select(-Date) %>%
+  mutate_at(vars(-ticker), funs(as.numeric)) %>% left_join(mutate_at(static, vars(-ticker), funs(as.numeric)), by = 'ticker') %>% select(ticker, everything())
+
+data <- left_join(clusters, data, by = 'ticker') %>% filter(complete.cases(.)) %>% as.data.frame()
+rownames(data) <- data$ticker; data <- select(data, -ticker)
+
+set.seed(4321L); split <- sample(1L:nrow(data), 0.6 * nrow(data))
+
+train <- data[split, ]; scaled <- scale(train[, names(train) != 'category']); train[, names(train) != 'category'] <- scaled
+
+test <- data[-split, ]
+test[, names(test) != 'category'] <- sweep(sweep(test[, names(test) != 'category'], 2L, attributes(scaled)$`scaled:center`), 
+                                           2L, attributes(scaled)$`scaled:scale`, '/')
+```
+
+
+
+#### Feature selection
+
+Subset selection
+
+#### Exhaustive
+
+```{r message = FALSE, warning = FALSE}
+library(leaps)
+
+full <- regsubsets(category∼., data = train, nvmax = ncol(data) - 1L)
+plot(full , scale = 'adjr2')
+best_full <- which(summary(full)$adjr2 == max(summary(full)$adjr2))
+best_full <- tibble(variable = names(summary(full)$which[best_full, ]), 
+                    `in` = summary(full)$which[best_full, ]) %>%
+  filter(`in`, variable != '(Intercept)')
+best_full <- best_full$variable
+```
+
+#### Forward selection
+```{r message = FALSE, warning = FALSE}
+
+forward <- regsubsets(category∼., data = train , nvmax = ncol(data) - 1L, method = 'forward')
+plot(forward , scale = 'adjr2')
+best_forward <- which(summary(forward)$adjr2 == max(summary(forward)$adjr2))
+best_forward <- tibble(variable = names(summary(forward)$which[best_forward, ]), 
+                    `in` = summary(forward)$which[best_forward, ]) %>%
+  filter(`in`, variable != '(Intercept)')
+best_forward <- best_forward$variable
+```
+
+#### Backward selection
+```{r message = FALSE, warning = FALSE}
+
+backward <- regsubsets(category∼., data = train , nvmax = ncol(data) - 1L, method = 'backward')
+plot(backward , scale = 'adjr2')
+best_backward <- which(summary(backward)$adjr2 == max(summary(backward)$adjr2))
+best_backward <- tibble(variable = names(summary(backward)$which[best_backward, ]), 
+                    `in` = summary(backward)$which[best_backward, ]) %>%
+  filter(`in`, variable != '(Intercept)')
+best_backward <- best_backward$variable
+```
+
+#### Select best features
+```{r message = FALSE, warning = FALSE}
+features <- intersect(best_full, intersect(best_forward, best_backward))
+```
+
+
+
+### Model
+
+
+#### Prepare dataset
+```{r message = FALSE, warning = FALSE}
+train <- train[, c('category', features)]; train[, 'category'] <- factor(train[, 'category'])
+test <- test[, c('category', features)]; test[, 'category'] <- factor(test[, 'category'])
+
+```
+
+
+#### Logistic regression
+
+##### Basic model
+```{r message = FALSE, warning = FALSE}
+library(caret); library(ROCR)
+rocplot <- function(pred, truth, ...) {predob <- prediction(pred , truth); perf <- performance(predob , 'tpr', 'fpr'); plot(perf, ...)}
+
+
+x <- subset(train, select = -category); y <- train$category
+logistic <- train(x, y, method = 'glm', family = 'binomial')
+predictions <- predict(logistic, x)
+confusionMatrix(predictions, y)
+
+
+x <- subset(test, select = -category); y <- test$category
+predictions <- predict(logistic, x)
+confusionMatrix(predictions, y)
+
+rocplot(as.integer(predictions), as.integer(test$category), main = 'test data')
+```
+
+
+##### Penalized logistic regression
+```{r message = FALSE, warning = TRUE}
+
+train[, 'category'] <- ifelse(train[, 'category'] == 1L, 1L, 0L)
+train[, 'category'] <- factor(train[, 'category'])
+
+x <- subset(train, select = -category); y <- train$category
+
+logistic <- train(x, y, family = 'binomial', method = 'plr', lambda = 1)
+predictions <- predict(logistic, train[, -1L])
+confusionMatrix(predictions, train[, 1L])
+
+predictions <- predict(logistic, test[, -1L])
+confusionMatrix(predictions, test[, 1L])
+
+rocplot(as.integer(predictions), as.integer(test$category), main = 'test data')
+
+
+logistic_model_1 <- train(category ~ ., data = train, method = 'glm')
+confusionMatrix(predict(logistic_model_1, train), reference = train$category, positive = 'value')
+
+```
+
+##### Test set
+```{r message = FALSE, warning = FALSE}
+data <- filter(historical, ticker != !!ticker_market) %>% group_by(ticker) %>% filter(row_number() == n()) %>% ungroup() %>% select(-Date) %>%
+  mutate_at(vars(-ticker), funs(as.numeric)) %>% 
+  left_join(mutate_at(static, vars(-ticker), funs(as.numeric)), by = 'ticker') %>%
+  select(ticker, everything())
+
+data <- left_join(clusters, data, by = 'ticker') %>% filter(complete.cases(.)) %>% as.data.frame()
+rownames(data) <- data$ticker; data <- select(data, -ticker)
+
+data[, 'category'] <- factor(ifelse(data[, 'category'] == 1L, 'value', 'growth'))
+
+
+set.seed(4321L)
+
+split <- createDataPartition(y = data$category, p = 0.60, list = FALSE)
+train <- data[split, ]
+test <- data[-split, ]
+
+ctrl <- trainControl(method = 'repeatedcv', repeats = 3L, number = 5L, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+plsFit <- train(category ~ ., data = train, method = 'pls', preProc = c('center', 'scale'), tuneLength = 15L, trControl = ctrl, metric = 'ROC')
+
+ggplot(plsFit)
+
+
+plsClasses <- predict(plsFit, newdata = test)
+str(plsClasses)
+plsProbs <- predict(plsFit, newdata = test, type = 'prob')
+head(plsProbs)
+
+confusionMatrix(data = plsClasses, test$category)
+
+
+
+
+plrGrid = data.frame(lambda = rep(seq(0.001, 0.01, 0.001), 2L), cp = sort(rep(c('aic', 'bic'), 10L)))
+
+ctrl <- trainControl(method = 'repeatedcv', repeats = 3L, number = 5L, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+plrFit <- train(category ~ ., data = train, method = 'plr', preProc = c('center', 'scale'), tuneGrid = plrGrid, trControl = ctrl, metric = 'ROC')
+
+ggplot(plrFit)
+
+
+plrClasses <- predict(plrFit, newdata = test)
+str(plrClasses)
+plrProbs <- predict(plrFit, newdata = test, type = 'prob')
+head(plrProbs)
+
+confusionMatrix(data = plrClasses, test$category)
+
+```
+
+
+
+#### k
+
+
+
+# Python
+
+## Extract
+
+See excel file in that folder
+
+## Load
+```{python}
+import pandas as pd; import numpy as np
+import matplotlib.pyplot as plt; import seaborn as sns
+import statsmodels.api as sm; import scipy.stats as ss
+
+workbook, window, ticker_market = pd.ExcelFile('../data-raw/pullit - RAY Index.xlsm'), 252, 'RAY Index'
+tickers = pd.read_excel(workbook, sheet_name = 'update', usecols = 'D', dtype = 'str').ticker.values
+tickers = [ticker.replace('/', '~') for ticker in tickers]
+
+static = pd.read_excel(workbook, sheet_name = 'update', usecols = 'D, F, G')
+static = static.loc[static['ticker'] != ticker_market].set_index('ticker')
+
+historical = {ticker: pd.read_excel(workbook, skiprows = 1, sheet_name  = ticker)
+        for ticker in tickers}
+historical = pd.concat(historical.values(), keys = historical.keys()).dropna(subset = ['Date'])\
+    .reset_index().drop('level_1', axis = 1)
+historical.rename(columns = {'level_0': 'ticker', 'Date': 'date'}, inplace = True)
+historical.set_index(['ticker', 'date'], inplace = True)
+```
+
+
+
+## Transform
+
+### 1-year market betas
+
+#### Figures
+
+```{python warning = FALSE}
+betas = historical[['PX_LAST']].unstack('ticker').xs('PX_LAST', axis = 1, drop_level = True)\
+    .pct_change().dropna().iloc[-window:, ]
+    
+market = betas[ticker_market]; betas.drop(ticker_market, axis = 1, inplace = True)
+
+betas = betas.apply(lambda stock: ss.linregress(x = market, y = stock).slope, axis = 0)
+betas = pd.DataFrame(betas).reset_index(); betas.columns = ['ticker', 'beta']   
+```
+
+```{python fig.height = 4.75, fig.width = 9.5}
+# print(type(betas[['beta']]))
+betas['beta'].plot.hist(grid = False, bins = 20, rwidth = 0.9, color = '#607c8e')
+plt.title('Contemporaneous 1-year market betas distribution')
+plt.xlabel('market beta')
+plt.ylabel('')
+```
+
+
+#### Plot
+```{python}
+import plotly as plty; import plotly.figure_factory as ff
+
+fig = ff.create_distplot([betas.beta], ['market betas'], show_hist = True)
+plty.offline.plot(fig)
+```
+
+
+### 1-year rolling market betas
+```{python}
+import feather as ftr
+
+betas = historical[['PX_LAST']].unstack('ticker').xs('PX_LAST', axis = 1, drop_level = True)\
+    .pct_change()
+
+market = betas[ticker_market]; betas.drop(ticker_market, axis = 1, inplace = True)
+
+# ftr.write_feather(betas, '../data-raw/returns')
+?ftr
+# betas = {betas.index[i].strftime('%Y-%m-%d'): betas.iloc[(i - window):i, ]\
+#          .apply(lambda stock: ss.linregress(x = market[(i - window):i], y = stock).slope, axis = 0)
+#          for i in range(window, len(betas))}
+# betas = pd.DataFrame(pd.concat(betas, ignore_index = False)).reset_index()\
+#     .rename(columns = {'level_0': 'date', 0: 'beta'}).dropna()\
+#     .set_index(['date', 'ticker']).unstack('ticker').\
+#     xs('beta', axis = 1, drop_level = True)
+```
+
+
+
+```{python}
+
+print(betas)
+```
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.

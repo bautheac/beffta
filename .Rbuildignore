@@ -1,0 +1,8 @@
+^docs$
+^_pkgdown\.yml$
+^data-raw$
+^appveyor\.yml$
+^\.travis\.yml$
+^LICENSE\.md$
+^.*\.Rproj$
+^\.Rproj\.user$

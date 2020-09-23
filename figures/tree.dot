@@ -1,0 +1,8 @@
+digraph Tree {
+node [shape=box, style="filled", color="black"] ;
+0 [label="price / book <= 3.127\nsamples = 36\nvalue = [19, 17]\nclass = value", fillcolor="#e581391b"] ;
+1 [label="samples = 18\nvalue = [1, 17]\nclass = growth", fillcolor="#399de5f0"] ;
+0 -> 1 [labeldistance=2.5, labelangle=45, headlabel="True"] ;
+2 [label="samples = 18\nvalue = [18, 0]\nclass = value", fillcolor="#e58139ff"] ;
+0 -> 2 [labeldistance=2.5, labelangle=-45, headlabel="False"] ;
+}
